@@ -1,0 +1,8 @@
+/build*/
+/FEFW-*/
+/pgo-*/
+*.zip
+*.etl
+*.pgc
+*.pgd
+eden-fefw-1.12/.cache/

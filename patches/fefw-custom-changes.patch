@@ -1,0 +1,787 @@
+diff -ruN v15src/eden-fefw-1.12/src/core/memory.cpp src/eden-fefw-1.12/src/core/memory.cpp
+--- v15src/eden-fefw-1.12/src/core/memory.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/core/memory.cpp	2026-11-07 13:31:19.217943600 -0800
+@@ -801,15 +801,15 @@
+         }
+     };
+ 
+-    /// EDEN_CPU_WRITE_PAGES=N (1-64, default 16): how many of a core's last held pages are held
+-    /// again without asking the GPU caches (1: only the last one, as before). Fortune's Weave
+-    /// writes back and forth across a few pages at a time: with 1, busy scenes (Dagsion) asked the
+-    /// caches up to ~230000 times a second, waiting for the draw thread's lock; 16 skips ~85% of
+-    /// those (doubled frames at 60 FPS in Dagsion: 33% -> 20%).
++    /// EDEN_CPU_WRITE_PAGES=N (1-64, default 1): how many of a core's last held pages are held
++    /// again without asking the GPU caches (1: only the last one). 16 made frames come out
++    /// unevenly (issue #2: held writes reached the GPU a batch late), so it is opt-in only.
++    /// Fortune's Weave writes back and forth across a few pages at a time: with 1, busy scenes
++    /// (Dagsion) ask the caches up to ~230000 times a second; 16 skips ~85% of those.
+     static u32 CpuWritePages() {
+         static const u32 pages = [] {
+             const char* const value = std::getenv("EDEN_CPU_WRITE_PAGES");
+-            const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 16;
++            const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
+             const u32 result = parsed < 1 ? 1U : parsed > 64 ? 64U : static_cast<u32>(parsed);
+             if (result != 1) {
+                 LOG_INFO(HW_Memory, "EDEN_CPU_WRITE_PAGES={}: held guest writes remember {} pages per core",
+diff -ruN v15src/eden-fefw-1.12/src/video_core/back_thread_stats.cpp src/eden-fefw-1.12/src/video_core/back_thread_stats.cpp
+--- v15src/eden-fefw-1.12/src/video_core/back_thread_stats.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/back_thread_stats.cpp	2026-11-07 23:43:06.600714400 -0800
+@@ -163,7 +163,8 @@
+     LOG_INFO(Render_Vulkan,
+              "Back thread tables and ranges: handle table downloads {:.1f}/s, {:.0f} us each, {:.0f} "
+              "draws since the last compute dispatch, bytes same as the last download {:.0f}%; "
+-             "compact table builds {:.0f}/s, {:.0f} elements, {:.1f}% changed ({:.0f}/s resized); "
++             "compact table builds {:.0f}/s, {:.0f} elements, {:.1f}% changed ({:.0f}/s resized, {:.1f}% "
++             "same as one of the table's last 4 builds); "
+              "IsRegionGpuModified {:.0f}/s, true {:.1f}%, within one page {:.1f}%",
+              per_s(d.table_downloads), avg(d.table_download_ticks, d.table_downloads) / ticks_per_us,
+              avg(d.table_draws_since_compute, d.table_downloads),
+@@ -175,7 +176,11 @@
+              d.build_elements != 0 ? static_cast<double>(d.build_changed) * 100.0 /
+                                          static_cast<double>(d.build_elements)
+                                    : 0.0,
+-             per_s(d.build_resized), per_s(gm_queries),
++             per_s(d.build_resized),
++             d.builds != 0 ? static_cast<double>(d.build_history_hits) * 100.0 /
++                                 static_cast<double>(d.builds)
++                           : 0.0,
++             per_s(gm_queries),
+              gm_queries != 0 ? static_cast<double>(Take(shared.gpu_modified_true)) * 100.0 /
+                                    static_cast<double>(gm_queries)
+                              : 0.0,
+@@ -329,9 +334,9 @@
+     LOG_INFO(Render_Vulkan,
+              "Guest CPU writes to cached pages: buffer cache answered unregistered {:.0f}/s, held "
+              "{:.0f}/s, written {:.0f}/s; held on one of the core's last 16 held pages {:.0f}/s; held "
+-             "without asking (EDEN_CPU_WRITE_PAGES) {:.0f}/s",
++             "without asking (EDEN_CPU_WRITE_PAGES) {:.0f}/s; held without the lock {:.0f}/s",
+              per_s(unregistered), per_s(held), per_s(written), per_s(Take(shared.cpu_write_would_hit)),
+-             per_s(Take(shared.cpu_write_skipped)));
++             per_s(Take(shared.cpu_write_skipped)), per_s(Take(shared.cpu_write_fast_held)));
+     LOG_INFO(Render_Vulkan,
+              "Cache locks: {}; {}; {}; {}. Split front: {:.0f} drains/s waiting {:.0f} us/s, ring "
+              "space {:.0f} us/s",
+diff -ruN v15src/eden-fefw-1.12/src/video_core/back_thread_stats.h src/eden-fefw-1.12/src/video_core/back_thread_stats.h
+--- v15src/eden-fefw-1.12/src/video_core/back_thread_stats.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/back_thread_stats.h	2026-11-07 23:43:06.533129600 -0800
+@@ -129,6 +129,7 @@
+     u64 build_elements{};
+     u64 build_changed{};
+     u64 build_resized{};        ///< Builds with another element count (not compared)
++    u64 build_history_hits{};   ///< Builds whose input equals one of the table's last 4 builds
+ };
+ extern DrawThread draw_thread;
+ 
+@@ -223,6 +224,7 @@
+     std::atomic<u64> cpu_write_written{};      ///< Marked CPU-modified (the texture cache is told)
+     std::atomic<u64> cpu_write_would_hit{};    ///< Held, on one of the core's last 16 held pages
+     std::atomic<u64> cpu_write_skipped{};      ///< Held without asking (EDEN_CPU_WRITE_PAGES)
++    std::atomic<u64> cpu_write_fast_held{};    ///< Held without the cache lock (TryHoldCpuWriteFast)
+     // BufferCache::IsRegionGpuModified (under the buffer cache lock, any thread).
+     // Calls the front queues around command lists (any thread runs them without the split).
+     std::atomic<u64> list_start{};   ///< GPU::InvalidateGPUCache: applying held guest writes
+diff -ruN v15src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache.h src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache.h
+--- v15src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache.h	2026-11-07 23:15:48.818382600 -0800
+@@ -8,6 +8,9 @@
+ 
+ #include <unordered_set>
+ #include <algorithm>
++#include <bit>
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <numeric>
+ #include <set>
+@@ -27,14 +30,37 @@
+ 
+ namespace VideoCommon {
+ 
++using Core::DEVICE_PAGEBITS;
+ using Core::DEVICE_PAGESIZE;
+ 
++/// Pages in the GPU device address space, for the GPU-modified page bitmap (512 KiB of bits).
++inline constexpr u64 GPU_MODIFIED_PAGE_COUNT =
++    1ULL << (Tegra::MaxwellDeviceTraits::device_virtual_bits - Core::DEVICE_PAGEBITS);
++static_assert(GPU_MODIFIED_PAGE_COUNT % 64 == 0);
++
+ template <class P>
+ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, Runtime& runtime_)
+     : runtime{runtime_}, device_memory{device_memory_}, memory_tracker{device_memory} {
+     // Ensure the first slot is used for the null buffer
+     void(slot_buffers.insert(runtime, NullBufferParams{}));
+     gpu_modified_ranges.Clear();
++    {
++        const char* const no_filter = std::getenv("EDEN_NO_PAGE_FILTER");
++        use_page_filter = no_filter == nullptr || std::strcmp(no_filter, "1") != 0;
++        if (use_page_filter) {
++            gpu_modified_pages.assign(GPU_MODIFIED_PAGE_COUNT / 64, 0);
++        } else {
++            LOG_INFO(HW_GPU, "EDEN_NO_PAGE_FILTER=1: GPU-modified page bitmap off");
++        }
++        // Off by default: with the game's CPU threads no longer queueing on the lock, held writes
++        // piled up into larger, rarer batches and frames came out unevenly in crowds.
++        const char* const fast_hold = std::getenv("EDEN_FAST_HOLD");
++        use_fast_hold = fast_hold != nullptr && std::strcmp(fast_hold, "1") == 0;
++        if (use_fast_hold) {
++            registered_pages.reset(new std::atomic<u64>[GPU_MODIFIED_PAGE_COUNT / 64]());
++            LOG_INFO(HW_GPU, "EDEN_FAST_HOLD=1: held CPU writes answered without the cache lock");
++        }
++    }
+     inline_buffer_id = NULL_BUFFER_ID;
+ #ifdef YUZU_LEGACY
+     immediately_free = (Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive);
+@@ -292,7 +318,7 @@
+     gpu_modified_ranges.Subtract(*cpu_dest_address, amount);
+     const bool has_new_downloads = tmp_intervals.size() != 0;
+     for (const auto& pair : tmp_intervals) {
+-        gpu_modified_ranges.Add(pair.first, pair.second);
++        AddGpuModifiedRange(pair.first, pair.second);
+     }
+     const auto& copy = copies[0];
+     src_buffer.MarkUsage(copy.src_offset, copy.size);
+@@ -778,7 +804,13 @@
+ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
+     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
+     // inline uploads once GPU-written ranges are no longer cleared by downloads).
+-    const bool modified = gpu_modified_ranges.Intersects(addr, size);
++    bool modified = false;
++    if (!use_page_filter || size == 0 || AnyGpuModifiedPage(addr, size)) {
++        modified = gpu_modified_ranges.Intersects(addr, size);
++        if (!modified && use_page_filter) {
++            ClearEmptyGpuModifiedPages(addr, size);
++        }
++    }
+     if (VideoCommon::BackStats::Enabled()) {
+         namespace BackStats = VideoCommon::BackStats;
+         BackStats::Add(BackStats::shared.gpu_modified_queries, 1);
+@@ -793,6 +825,54 @@
+ }
+ 
+ template <class P>
++void BufferCache<P>::AddGpuModifiedRange(DAddr addr, size_t size) {
++    gpu_modified_ranges.Add(addr, size);
++    if (!use_page_filter || size == 0) {
++        return;
++    }
++    const u64 first = addr >> DEVICE_PAGEBITS;
++    const u64 last = std::min<u64>((addr + size - 1) >> DEVICE_PAGEBITS, GPU_MODIFIED_PAGE_COUNT - 1);
++    for (u64 page = first; page <= last; ++page) {
++        gpu_modified_pages[page >> 6] |= 1ULL << (page & 63);
++    }
++}
++
++template <class P>
++bool BufferCache<P>::AnyGpuModifiedPage(DAddr addr, size_t size) const {
++    const u64 first = addr >> DEVICE_PAGEBITS;
++    const u64 last = (addr + size - 1) >> DEVICE_PAGEBITS;
++    if (last >= GPU_MODIFIED_PAGE_COUNT || last < first) {
++        return true; // Outside the bitmap: let the range set answer.
++    }
++    const u64 first_word = first >> 6;
++    const u64 last_word = last >> 6;
++    for (u64 word = first_word; word <= last_word; ++word) {
++        u64 bits = gpu_modified_pages[word];
++        if (word == first_word) {
++            bits &= ~0ULL << (first & 63);
++        }
++        if (word == last_word) {
++            bits &= ~0ULL >> (63 - (last & 63));
++        }
++        if (bits != 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++template <class P>
++void BufferCache<P>::ClearEmptyGpuModifiedPages(DAddr addr, size_t size) {
++    // The range set just found nothing in [addr, addr + size), so every page lying wholly inside
++    // it is empty. Pages the query only partly covers may still hold a range and stay set.
++    const u64 first = Common::DivCeil(addr, DEVICE_PAGESIZE);
++    const u64 end = std::min<u64>((addr + size) >> DEVICE_PAGEBITS, GPU_MODIFIED_PAGE_COUNT);
++    for (u64 page = first; page < end; ++page) {
++        gpu_modified_pages[page >> 6] &= ~(1ULL << (page & 63));
++    }
++}
++
++template <class P>
+ bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
+     const DAddr end_addr = addr + size;
+     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
+@@ -1765,7 +1845,7 @@
+         }
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+-    gpu_modified_ranges.Add(device_addr, size);
++    AddGpuModifiedRange(device_addr, size);
+     QueueDownload(device_addr, size);
+ }
+ 
+@@ -1989,6 +2069,50 @@
+             page_table[page] = BufferId{};
+         }
+     }
++    MarkRegisteredPages(device_addr_begin, device_addr_end, insert);
++}
++
++template <class P>
++void BufferCache<P>::MarkRegisteredPages(DAddr begin, DAddr end, bool registered) noexcept {
++    if (!use_fast_hold || end <= begin) {
++        return;
++    }
++    // Registering marks only pages the buffer covers whole; unregistering clears every page it
++    // touches. A set bit therefore always lies inside some registered buffer.
++    const u64 first = registered ? Common::DivCeil(begin, DEVICE_PAGESIZE) : begin >> DEVICE_PAGEBITS;
++    const u64 last_end = std::min<u64>(
++        registered ? end >> DEVICE_PAGEBITS : Common::DivCeil(end, DEVICE_PAGESIZE),
++        GPU_MODIFIED_PAGE_COUNT);
++    for (u64 page = first; page < last_end; ++page) {
++        const u64 bit = 1ULL << (page & 63);
++        if (registered) {
++            registered_pages[page >> 6].fetch_or(bit, std::memory_order_release);
++        } else {
++            registered_pages[page >> 6].fetch_and(~bit, std::memory_order_release);
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::TryHoldCpuWriteFast(DAddr device_addr, u64 size) const noexcept {
++    if (!use_fast_hold || size == 0) {
++        return false;
++    }
++    const u64 first = device_addr >> DEVICE_PAGEBITS;
++    const u64 last = (device_addr + size - 1) >> DEVICE_PAGEBITS;
++    if (last >= GPU_MODIFIED_PAGE_COUNT || last < first) {
++        return false;
++    }
++    // A registered page in the range means IsRegionRegistered is true; a GPU-modified page in
++    // the range means the tracker's IsRegionGpuModified is true: OnCPUWrite would hold it.
++    bool registered = false;
++    for (u64 page = first; page <= last; ++page) {
++        if ((registered_pages[page >> 6].load(std::memory_order_acquire) >> (page & 63)) & 1) {
++            registered = true;
++            break;
++        }
++    }
++    return registered && memory_tracker.IsRegionGpuModifiedFast(device_addr, size);
+ }
+ 
+ template <class P>
+diff -ruN v15src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache_base.h src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache_base.h
+--- v15src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache_base.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/buffer_cache/buffer_cache_base.h	2026-11-07 23:15:49.102485000 -0800
+@@ -9,6 +9,7 @@
+ #include <cstdlib>
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <bit>
+ #include <functional>
+ #include <memory>
+@@ -260,6 +261,11 @@
+ 
+     bool OnCPUWrite(DAddr device_addr, u64 size);
+ 
++    /// True when OnCPUWrite would hold this write (a registered buffer page the GPU modified),
++    /// answered without the cache lock. False means "ask OnCPUWrite": it is never true where
++    /// OnCPUWrite would return false. Off unless EDEN_FAST_HOLD=1.
++    [[nodiscard]] bool TryHoldCpuWriteFast(DAddr device_addr, u64 size) const noexcept;
++
+     void DownloadMemory(DAddr device_addr, u64 size);
+ 
+     using DownloadSnapshot =
+@@ -551,6 +557,23 @@
+     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
+     Common::RangeSet<DAddr> gpu_modified_ranges;
+ 
++    /// One bit per 4 KiB device page that may hold part of gpu_modified_ranges. A bit is set on
++    /// every Add and only cleared after a full search finds the page empty, so a clear bit always
++    /// means "not GPU modified". Most IsRegionGpuModified answers in crowded scenes are no, and the
++    /// bitmap gives them without searching the range set. EDEN_NO_PAGE_FILTER=1 turns it off.
++    std::vector<u64> gpu_modified_pages;
++    bool use_page_filter = true;
++
++    /// One bit per 4 KiB device page lying wholly inside a registered buffer, for
++    /// TryHoldCpuWriteFast. Set on register; cleared on unregister for every page the buffer
++    /// touches, so a set bit always means "registered".
++    std::unique_ptr<std::atomic<u64>[]> registered_pages;
++    bool use_fast_hold = true;
++    void MarkRegisteredPages(DAddr begin, DAddr end, bool registered) noexcept;
++    void AddGpuModifiedRange(DAddr addr, size_t size);
++    [[nodiscard]] bool AnyGpuModifiedPage(DAddr addr, size_t size) const;
++    void ClearEmptyGpuModifiedPages(DAddr addr, size_t size);
++
+     /// Whether every GPU-written range is copied back to guest memory at the next fence. Switch 2
+     /// titles (native tiling) copy back only what their CPU reads (cpu_read_ranges): copying
+     /// everything is a large part of each fence's cost, and the reactive flush still brings any
+diff -ruN v15src/eden-fefw-1.12/src/video_core/buffer_cache/memory_tracker_base.h src/eden-fefw-1.12/src/video_core/buffer_cache/memory_tracker_base.h
+--- v15src/eden-fefw-1.12/src/video_core/buffer_cache/memory_tracker_base.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/buffer_cache/memory_tracker_base.h	2026-11-07 22:59:20.312678300 -0800
+@@ -7,9 +7,11 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
+ #include <deque>
+ #include <limits>
++#include <memory>
+ #include <type_traits>
+ #include "common/container/unordered_set.h"
+ #include <utility>
+@@ -32,7 +34,10 @@
+     using Manager = WordManager<DeviceTracker, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
+ 
+ public:
+-    MemoryTrackerBase(DeviceTracker& device_tracker_) : device_tracker{&device_tracker_} {}
++    MemoryTrackerBase(DeviceTracker& device_tracker_)
++        : device_tracker{&device_tracker_} {
++        gpu_mirror.reset(new std::atomic<u64>[MIRROR_WORDS]());
++    }
+     ~MemoryTrackerBase() = default;
+ 
+     /// Returns the inclusive CPU modified range in a begin end pair
+@@ -75,6 +80,7 @@
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
+         });
++        RefreshGpuMirror(dirty_cpu_addr, query_size);
+     }
+ 
+     /// Unmark region as CPU modified, notifying the device_tracker about this change
+@@ -82,6 +88,7 @@
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::CPU, false, manager->cpu_addr + offset, size);
+         });
++        RefreshGpuMirror(dirty_cpu_addr, query_size);
+     }
+ 
+     /// Mark region as modified from the host GPU
+@@ -89,6 +96,7 @@
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
+         });
++        RefreshGpuMirror(dirty_cpu_addr, query_size);
+     }
+ 
+     /// Mark region as modified from the host GPU
+@@ -103,6 +111,7 @@
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::GPU, false, manager->cpu_addr + offset, size);
+         });
++        RefreshGpuMirror(dirty_cpu_addr, query_size);
+     }
+ 
+     /// Unmark region as modified from the host GPU
+@@ -120,6 +129,7 @@
+             manager->ChangeRegionState(Type::CachedCPU, true, cpu_address, size);
+             cached_pages.insert(u32(cpu_address >> HIGHER_PAGE_BITS));
+         });
++        RefreshGpuMirror(dirty_cpu_addr, query_size);
+     }
+ 
+     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
+@@ -127,11 +137,18 @@
+         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
+             manager->FlushCachedWrites();
+         });
++        // Each touched manager flushed all of its pages, not only the queried ones.
++        if (query_size != 0) {
++            const VAddr begin = query_cpu_addr & ~HIGHER_PAGE_MASK;
++            const VAddr end = Common::AlignUp(query_cpu_addr + query_size, HIGHER_PAGE_SIZE);
++            RefreshGpuMirror(begin, end - begin);
++        }
+     }
+ 
+     void FlushCachedWrites() noexcept {
+         for (auto id : cached_pages) {
+             top_tier[id]->FlushCachedWrites();
++            RefreshGpuMirror(VAddr{id} << HIGHER_PAGE_BITS, HIGHER_PAGE_SIZE);
+         }
+         cached_pages.clear();
+     }
+@@ -142,6 +159,7 @@
+         IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+         });
++        RefreshGpuMirror(query_cpu_range, query_size);
+     }
+ 
+     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
+@@ -150,6 +168,9 @@
+         IteratePages<false>(query_cpu_range, query_size, [&func, clear](Manager* manager, u64 offset, size_t size) {
+             manager->ForEachModifiedRange(Type::GPU, clear, manager->cpu_addr + offset, size, func);
+         });
++        if (clear) {
++            RefreshGpuMirror(query_cpu_range, query_size);
++        }
+     }
+ 
+     template <typename Func>
+@@ -157,6 +178,62 @@
+         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+             manager->ForEachModifiedRange(Type::GPU, true, manager->cpu_addr + offset, size, func);
+         });
++        RefreshGpuMirror(query_cpu_range, query_size);
++    }
++
++    /// IsRegionGpuModified without a lock, read from the mirror: the state at some moment
++    /// during the call.
++    [[nodiscard]] bool IsRegionGpuModifiedFast(VAddr query_cpu_addr, u64 query_size) const noexcept {
++        if (query_size == 0) {
++            return false;
++        }
++        const u64 first = query_cpu_addr / BYTES_PER_PAGE;
++        const u64 last = (query_cpu_addr + query_size - 1) / BYTES_PER_PAGE;
++        if (last >= MIRROR_WORDS * PAGES_PER_WORD || last < first) {
++            return false;
++        }
++        for (u64 word = first / PAGES_PER_WORD; word <= last / PAGES_PER_WORD; ++word) {
++            u64 bits = gpu_mirror[word].load(std::memory_order_acquire);
++            if (word == first / PAGES_PER_WORD) {
++                bits &= ~0ULL << (first % PAGES_PER_WORD);
++            }
++            if (word == last / PAGES_PER_WORD) {
++                bits &= ~0ULL >> (PAGES_PER_WORD - 1 - last % PAGES_PER_WORD);
++            }
++            if (bits != 0) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++private:
++    static constexpr size_t MIRROR_WORDS = (1ULL << MAX_CPU_PAGE_BITS) / BYTES_PER_WORD;
++
++    /// Copies the GPU-modified state of every word overlapping [addr, addr + size) into the
++    /// mirror. Called after each change, under the same lock as the change.
++    void RefreshGpuMirror(VAddr addr, u64 size) noexcept {
++        if (size == 0) {
++            return;
++        }
++        const VAddr end = addr + size;
++        for (size_t page_index = addr >> HIGHER_PAGE_BITS;
++             page_index <= ((end - 1) >> HIGHER_PAGE_BITS) && page_index < NUM_HIGH_PAGES;
++             ++page_index) {
++            const Manager* const manager = top_tier[page_index];
++            if (manager == nullptr) {
++                continue;
++            }
++            const VAddr base = VAddr{page_index} << HIGHER_PAGE_BITS;
++            const u64 start_offset = (std::max)(addr, base) - base;
++            const u64 end_offset = (std::min)(end, base + HIGHER_PAGE_SIZE) - base;
++            const size_t mirror_base = base / BYTES_PER_WORD;
++            for (size_t word = start_offset / BYTES_PER_WORD;
++                 word <= (end_offset - 1) / BYTES_PER_WORD; ++word) {
++                gpu_mirror[mirror_base + word].store(manager->EffectiveGpuWord(word),
++                                                     std::memory_order_release);
++            }
++        }
+     }
+ 
+ private:
+@@ -258,6 +335,8 @@
+     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
+     std::deque<Manager*> free_managers;
+     ::Common::unordered_set<u32> cached_pages;
++    /// GPU-modified pages (one bit per page, all of device memory) for IsRegionGpuModifiedFast.
++    std::unique_ptr<std::atomic<u64>[]> gpu_mirror;
+     DeviceTracker* device_tracker = nullptr;
+ };
+ 
+diff -ruN v15src/eden-fefw-1.12/src/video_core/buffer_cache/word_manager.h src/eden-fefw-1.12/src/video_core/buffer_cache/word_manager.h
+--- v15src/eden-fefw-1.12/src/video_core/buffer_cache/word_manager.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/buffer_cache/word_manager.h	2026-11-07 22:53:54.064313600 -0800
+@@ -243,6 +243,11 @@
+             : std::make_pair<u64, u64>(0, 0);
+     }
+ 
++    /// GPU-modified pages of a word as IsRegionModified(Type::GPU) sees them.
++    [[nodiscard]] u64 EffectiveGpuWord(size_t index) const noexcept {
++        return Span(Type::GPU)[index] & ~Span(Type::Untracked)[index];
++    }
++
+     void FlushCachedWrites() noexcept {
+         auto const cached_words = Span(Type::CachedCPU);
+         auto const untracked_words = Span(Type::Untracked);
+diff -ruN v15src/eden-fefw-1.12/src/video_core/query_cache/query_cache_base.h src/eden-fefw-1.12/src/video_core/query_cache/query_cache_base.h
+--- v15src/eden-fefw-1.12/src/video_core/query_cache/query_cache_base.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/query_cache/query_cache_base.h	2026-11-07 23:22:49.803624200 -0800
+@@ -62,6 +62,19 @@
+                            [this](QueryLocation location) { InvalidateQuery(location); });
+     }
+ 
++    /// InvalidateRegion for each range in order, with the cache locked once (and nothing to do
++    /// when no query is cached, the usual case between draws).
++    void InvalidateRegions(std::span<const std::pair<u64, std::size_t>> sequences) {
++        std::scoped_lock lock(cache_mutex);
++        if (cached_queries.empty()) {
++            return;
++        }
++        for (const auto& [addr, size] : sequences) {
++            IterateCacheLocked<true>(addr, size,
++                                     [this](QueryLocation location) { InvalidateQuery(location); });
++        }
++    }
++
+     void FlushRegion(VAddr addr, std::size_t size) {
+         bool result = false;
+         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
+@@ -120,13 +133,19 @@
+ protected:
+     template <bool remove_from_cache, typename Func>
+     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
++        std::scoped_lock lock(cache_mutex);
++        IterateCacheLocked<remove_from_cache>(addr, size, std::forward<Func>(func));
++    }
++
++    /// @pre cache_mutex is locked
++    template <bool remove_from_cache, typename Func>
++    void IterateCacheLocked(VAddr addr, std::size_t size, Func&& func) {
+         static constexpr bool RETURNS_BOOL =
+             std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
+         const u64 addr_begin = addr;
+         const u64 addr_end = addr_begin + size;
+ 
+         const u64 page_end = addr_end >> Core::DEVICE_PAGEBITS;
+-        std::scoped_lock lock(cache_mutex);
+         for (u64 page = addr_begin >> Core::DEVICE_PAGEBITS; page <= page_end; ++page) {
+             const u64 page_start = page << Core::DEVICE_PAGEBITS;
+             const auto in_range = [page_start, addr_begin, addr_end](const u32 query_location) {
+diff -ruN v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp	2026-11-07 23:24:58.722411300 -0800
+@@ -1359,22 +1359,29 @@
+     bool update_descriptors = true;
+     if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
+         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+-        // The comparison runs only when the pipeline stays bound and the sizes match.
+-        const bool compares = !bind_pipeline && last_descriptor_payload.size() == num_descriptor_entries;
+-        if (BackStats::Enabled() && bind_pipeline &&
+-            last_descriptor_payload.size() == num_descriptor_entries &&
+-            std::memcmp(last_descriptor_payload.data(), entries,
++        // The last set this pipeline wrote is compared where it already sits in the descriptor
++        // payload instead of a copy of it: only ~3% of set draws keep the pipeline bound and
++        // compare, while copying ~70 KB for every set draw cost the back thread far more.
++        const bool last_live = last_set_entries != nullptr &&
++                               last_set_count == num_descriptor_entries &&
++                               guest_descriptor_queue.IsLive(last_set_stamp);
++        // The comparison runs only when the pipeline stays bound and the last set is readable.
++        const bool compares = !bind_pipeline && last_live;
++        if (BackStats::Enabled() && bind_pipeline && last_live &&
++            std::memcmp(last_set_entries, entries,
+                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0) {
+             // Statistics: a set this pipeline last wrote would have served (same entries).
+             ++draw_stats.set_rebound_same;
+         }
+         update_descriptors =
+-            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+-            std::memcmp(last_descriptor_payload.data(), entries,
++            bind_pipeline || !last_live ||
++            std::memcmp(last_set_entries, entries,
+                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
+-        if (update_descriptors) {
+-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+-        }
++        // Follow the newest copy even when the set is reused (the entries are equal then), so it
++        // stays readable for as long as possible.
++        last_set_entries = entries;
++        last_set_count = num_descriptor_entries;
++        last_set_stamp = guest_descriptor_queue.CurrentStamp();
+         if (BackStats::Enabled()) {
+             if (compares) {
+                 draw_stats.compared_bytes += payload_bytes;
+diff -ruN v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.h src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+--- v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_graphics_pipeline.h	2026-11-07 23:24:01.056180800 -0800
+@@ -223,6 +223,11 @@
+ 
+     DescriptorBufferLayout descriptor_buffer_layout;
+     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
++    /// The entries of the last descriptor set this pipeline wrote, where they sit in the guest
++    /// descriptor payload (readable while guest_descriptor_queue.IsLive(last_set_stamp)).
++    const DescriptorUpdateEntry* last_set_entries{};
++    size_t last_set_count{};
++    UpdateDescriptorQueue::Stamp last_set_stamp{};
+     VkDeviceSize last_descriptor_buffer_offset{};
+     u32 last_descriptor_buffer_chunk{};
+     u64 last_descriptor_buffer_generation{};
+diff -ruN v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_rasterizer.cpp src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-11-07 23:22:49.853417400 -0800
+@@ -863,9 +863,7 @@
+             buffer_cache.WriteMemory(addr, size);
+         }
+     }
+-    for (const auto& [addr, size] : sequences) {
+-        query_cache.InvalidateRegion(addr, size);
+-    }
++    query_cache.InvalidateRegions(sequences);
+     pipeline_cache.InvalidateRegions(sequences);
+ }
+ 
+@@ -907,6 +905,15 @@
+ 
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+     DEBUG_ASSERT(addr != 0 || size != 0);
++    // Most writes in crowded scenes land on buffer pages the GPU modified, which are held: say so
++    // without queueing for the buffer cache lock the draw thread holds for much of each frame.
++    if (buffer_cache.TryHoldCpuWriteFast(addr, size)) {
++        if (VideoCommon::BackStats::Enabled()) {
++            VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.cpu_write_held, 1);
++            VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.cpu_write_fast_held, 1);
++        }
++        return true;
++    }
+     {
+         const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cpu_write};
+         std::scoped_lock lock{buffer_cache.mutex};
+diff -ruN v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.cpp src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
+--- v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.cpp	2026-11-07 23:23:45.383563300 -0800
+@@ -30,6 +30,7 @@
+ UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
+ 
+ void UpdateDescriptorQueue::TickFrame() {
++    ++frame_count;
+     if (++frame_index >= FRAMES_IN_FLIGHT) {
+         frame_index = 0;
+     }
+@@ -63,6 +64,7 @@
+                         used, reserve, frame_payload_size);
+         }
+         payload_cursor = payload_start;
++        ++generation;
+     }
+     upload_start = payload_cursor;
+ }
+diff -ruN v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.h src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.h
+--- v15src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/renderer_vulkan/vk_update_descriptor.h	2026-11-07 23:23:45.266963600 -0800
+@@ -62,6 +62,20 @@
+         return upload_start;
+     }
+ 
++    /// When entries were written to the payload. Written entries are never changed, so they stay
++    /// readable until their slice comes round again (FRAMES_IN_FLIGHT frames) or an overflow
++    /// rewinds or reallocates the payload.
++    struct Stamp {
++        u64 generation;
++        u64 frame;
++    };
++    [[nodiscard]] Stamp CurrentStamp() const noexcept {
++        return {generation, frame_count};
++    }
++    [[nodiscard]] bool IsLive(const Stamp& stamp) const noexcept {
++        return stamp.generation == generation && frame_count - stamp.frame < FRAMES_IN_FLIGHT;
++    }
++
+     /// Where the next entry goes (the entries added since a call to this start there).
+     [[nodiscard]] const DescriptorUpdateEntry* Cursor() const noexcept {
+         return payload_cursor;
+@@ -134,6 +148,8 @@
+     const bool supports_descriptor_buffer;
+     bool use_descriptor_buffer{false};
+     size_t frame_index{0};
++    u64 frame_count{0};
++    u64 generation{0};
+     DescriptorUpdateEntry* payload_cursor = nullptr;
+     DescriptorUpdateEntry* payload_start = nullptr;
+     const DescriptorUpdateEntry* upload_start = nullptr;
+diff -ruN v15src/eden-fefw-1.12/src/video_core/shader_cache.cpp src/eden-fefw-1.12/src/video_core/shader_cache.cpp
+--- v15src/eden-fefw-1.12/src/video_core/shader_cache.cpp	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/shader_cache.cpp	2026-11-07 23:22:39.403300500 -0800
+@@ -41,8 +41,17 @@
+         return;
+     }
+     std::scoped_lock lock{invalidation_mutex};
++    {
++        // Rejections and invalidation pages are independent: drop them all under one lookup
++        // lock (skipped when there are none) instead of locking it again for every range.
++        std::scoped_lock lookup_lock{lookup_mutex};
++        if (!rejected_shaders.empty()) {
++            for (const auto& [addr, size] : sequences) {
++                DropRejectionsLocked(addr, size);
++            }
++        }
++    }
+     for (const auto& [addr, size] : sequences) {
+-        DropRejections(addr, size);
+         InvalidatePagesInRegion(addr, size);
+     }
+     RemovePendingShaders();
+@@ -220,6 +229,10 @@
+ 
+ void ShaderCache::DropRejections(VAddr addr, size_t size) {
+     std::scoped_lock lock{lookup_mutex};
++    DropRejectionsLocked(addr, size);
++}
++
++void ShaderCache::DropRejectionsLocked(VAddr addr, size_t size) {
+     if (rejected_shaders.empty()) {
+         return;
+     }
+diff -ruN v15src/eden-fefw-1.12/src/video_core/shader_cache.h src/eden-fefw-1.12/src/video_core/shader_cache.h
+--- v15src/eden-fefw-1.12/src/video_core/shader_cache.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/shader_cache.h	2026-11-07 23:22:39.442240800 -0800
+@@ -126,6 +126,8 @@
+     /// @brief Forgets remembered rejections overlapping a written region
+     /// @pre invalidation_mutex is locked
+     void DropRejections(VAddr addr, size_t size);
++    /// @pre lookup_mutex is locked
++    void DropRejectionsLocked(VAddr addr, size_t size);
+ 
+     /// @brief Register in the cache a given entry
+     /// @param data Shader to store in the cache
+diff -ruN v15src/eden-fefw-1.12/src/video_core/texture_cache/compact_texture_table.h src/eden-fefw-1.12/src/video_core/texture_cache/compact_texture_table.h
+--- v15src/eden-fefw-1.12/src/video_core/texture_cache/compact_texture_table.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/texture_cache/compact_texture_table.h	2026-11-07 23:43:06.696614600 -0800
+@@ -114,11 +114,26 @@
+     }
+ 
+ private:
++    /// Statistics: hashes of the last inputs Build was called with (EDEN_BACK_THREAD_STATS).
++    mutable std::array<u64, 4> recent_inputs{};
++    mutable size_t recent_next{};
++
+     /// Statistics: how many elements differ from the table as last built (EDEN_BACK_THREAD_STATS).
+     void CountChanges(std::span<const std::pair<u32, u32>> handles, std::span<const u8> excluded) const {
+         auto& stats = BackStats::draw_thread;
+         ++stats.builds;
+         stats.build_elements += handles.size();
++        // Would a few remembered tables per descriptor have served this build? Compare the input
++        // with the last 4 inputs this table was built from.
++        const u64 input_hash =
++            Common::CityHash64(reinterpret_cast<const char*>(handles.data()),
++                               handles.size() * sizeof(handles[0])) ^
++            (Common::CityHash64(reinterpret_cast<const char*>(excluded.data()), excluded.size()) * 31);
++        if (std::ranges::find(recent_inputs, input_hash) != recent_inputs.end()) {
++            ++stats.build_history_hits;
++        }
++        recent_inputs[recent_next] = input_hash;
++        recent_next = (recent_next + 1) % recent_inputs.size();
+         if (element_tics.size() != handles.size()) {
+             ++stats.build_resized;
+             stats.build_changed += handles.size();
+diff -ruN v15src/eden-fefw-1.12/src/video_core/texture_cache/texture_cache.h src/eden-fefw-1.12/src/video_core/texture_cache/texture_cache.h
+--- v15src/eden-fefw-1.12/src/video_core/texture_cache/texture_cache.h	2026-11-06 12:12:58.000000000 -0800
++++ src/eden-fefw-1.12/src/video_core/texture_cache/texture_cache.h	2026-11-07 13:31:36.469435600 -0800
+@@ -139,6 +139,14 @@
+             return false;
+         }
+         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++        // A GPU-drawn image that would be freed without being copied back loses what the GPU drew:
++        // guest memory never had it. Fortune's Weave draws its sky colour table once and keeps
++        // reading it, so freeing it while the map covered the screen turned Dagsion's sky black.
++        // Small ones are always kept, whatever the memory pressure.
++        if (!must_download && True(image.flags & ImageFlagBits::GpuModified) &&
++            image.guest_size_bytes <= 4_MiB) {
++            return false;
++        }
+         if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
+             return false;
+         }
