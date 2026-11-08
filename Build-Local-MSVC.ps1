@@ -321,14 +321,14 @@ Deleting the user folder deletes your saves.
 
 CHANGES FROM THE v1.4.2 SOURCE
 - Recurring stutter fixed by default: EDEN_CPU_WRITE_PAGES now defaults to 1 (was 16, issue #2).
-- Dagsion sky no longer turns black after the map: small GPU-drawn images are always kept.
 - "Has the GPU written here?" checks answered from a page bitmap first (EDEN_NO_PAGE_FILTER=1 turns it off).
 - Cache flushing before each draw locks the query and shader caches once per batch.
 - Descriptor sets are compared where they sit instead of copying ~70 KB per draw.
 - Optional EDEN_FAST_HOLD=1: held CPU writes answered without the cache lock. Higher average FPS in
   crowds but uneven frame times, so it is OFF by default.
 - Built with profile-guided optimisation trained on Dagsion crowds and compiled for AVX2.
-Not included from upstream v1.5: the ultrawide option, the CPU Clocks removal and the smaller logs.
+Not included from upstream v1.5: the Dagsion sky fix (removed in v1.1: our version filled video memory
+in long sessions), the ultrawide option, the CPU Clocks removal and the smaller logs.
 
 RECOMMENDED SETTINGS: 1x resolution, VRAM Usage Mode Conservative, GPU accuracy Fast, asynchronous
 shaders on. If NVIDIA DLSS causes crashes on your PC, turn it off.

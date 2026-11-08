@@ -8,7 +8,9 @@ Every change here was measured on real hardware with frame-time logs, the emulat
 
 ## Download
 
-Get `FEFW-Custom-Build-v1.0.zip` from **[Releases](../../releases)**.
+Get **`FEFW-Custom-Build-v1.1.zip`** from **[Releases](../../releases)**.
+
+**v1.1** removes v1.0's Dagsion sky fix. It kept GPU-drawn images in video memory permanently, which filled VRAM in long sessions. v1.1 uses the upstream v1.4.2 texture cache behaviour: in a 20-minute test on an RTX 4060 Ti, VRAM stayed at 7.8–8.5 GB (v1.0 reached ~16 GB).
 
 **Requirements:**
 - 64-bit Windows 10/11
@@ -20,14 +22,13 @@ Get `FEFW-Custom-Build-v1.0.zip` from **[Releases](../../releases)**.
 
 1. Extract the zip to a new folder (not inside Program Files).
 2. Coming from another Fortune's Eden build? Copy your old `user` folder into the new folder. It holds your saves, keys, firmware, settings and shader cache.
-3. Copy `launchers/Launch FEFW Fast.bat` from this repo next to `Fortune's Eden.exe`, and start the game with it. It runs the emulator at high priority.
+3. Start the game with `Launch FEFW Fast.bat` (included in the zip). It runs the emulator at high priority. `Launch Diagnostic.bat` also logs performance statistics.
 
 ## What changed compared with the v1.4.2 source
 
 | Change | Why | Switch |
 |---|---|---|
 | `EDEN_CPU_WRITE_PAGES` defaults to **1** (was 16) | 16 caused recurring stutter: held CPU writes reached the GPU a batch late ([upstream issue #2](https://github.com/TheSneakyBadger/FEFW-Stable-with-60-FPS-Patch/issues/2)) | `EDEN_CPU_WRITE_PAGES=N` |
-| Small GPU-drawn images (≤ 4 MB) are never freed by the texture cache | Dagsion's sky turned black after opening the map: its colour table was freed without being kept | — |
 | GPU-modified page bitmap in front of `IsRegionGpuModified` | ~730k checks/s in crowds, 99% answer "no" | `EDEN_NO_PAGE_FILTER=1` turns it off |
 | Cache flushing before each draw locks the query and shader caches once per batch, and skips them when empty | ~55k flush batches/s × ~4 ranges, each locking twice | — |
 | Descriptor sets are compared where they sit in the descriptor ring instead of copying ~70 KB per set draw | Only ~3% of set draws ever compared the copy | — |
@@ -37,7 +38,7 @@ Get `FEFW-Custom-Build-v1.0.zip` from **[Releases](../../releases)**.
 
 Exact code changes: [`patches/fefw-custom-changes.patch`](patches/fefw-custom-changes.patch). Full modified source: [`eden-fefw-1.12/`](eden-fefw-1.12).
 
-**Not included from upstream v1.5** (its source was not published when this was built): the ultrawide option, the CPU Clocks removal, the smaller logs and the version label in the title.
+**Not included from upstream v1.5** (its source was not published when this was built): the Dagsion sky fix, the ultrawide option, the CPU Clocks removal, the smaller logs and the version label in the title.
 
 ## Results (i5-10400F, RTX 4060 Ti 16 GB, 16 GB RAM, Dagsion's busiest crowd)
 

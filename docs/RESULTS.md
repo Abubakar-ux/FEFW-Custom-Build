@@ -41,3 +41,9 @@ Frame times come from the per-frame `QueueNativeImage` log lines. Back-thread nu
 ## Conclusion
 
 In big crowds the limit is shared between the GPU back thread (~70k draws/s on one thread) and the game's CPU threads contending for the cache locks. Further gains need a faster CPU (single-core speed) or a redesign of the emulator's GPU threading.
+
+## v1.1: long-session check
+
+v1.0's Dagsion sky fix kept every small GPU-drawn image that could not be copied back to guest memory. In this game many render targets are like that, so in a 32-minute v1.0 session they filled the RTX 4060 Ti's 16 GB of VRAM at 19 minutes (`heap0 usage=15935 MiB budget=15341 MiB`). The driver then placed new buffers in system RAM (`CheckPlacement` warnings), and from about 26 minutes on, frames over 50 ms rose to 160–210 per 2 minutes.
+
+v1.1 removes that fix (the upstream v1.4.2 texture cache). In a 20-minute session there were no `CheckPlacement` warnings and dedicated GPU memory stayed at 7.8–8.5 GB. Frame times after loading: 29.1 FPS average, p50 33.4 ms, p90 34.7 ms, p99 49.5 ms.

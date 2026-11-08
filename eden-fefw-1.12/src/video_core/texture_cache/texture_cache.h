@@ -139,14 +139,6 @@ void TextureCache<P>::RunGarbageCollector() {
             return false;
         }
         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        // A GPU-drawn image that would be freed without being copied back loses what the GPU drew:
-        // guest memory never had it. Fortune's Weave draws its sky colour table once and keeps
-        // reading it, so freeing it while the map covered the screen turned Dagsion's sky black.
-        // Small ones are always kept, whatever the memory pressure.
-        if (!must_download && True(image.flags & ImageFlagBits::GpuModified) &&
-            image.guest_size_bytes <= 4_MiB) {
-            return false;
-        }
         if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
             return false;
         }
